@@ -1,0 +1,466 @@
+name: GitHub Agent - AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Agent AWS operation
+        required: true
+        type: choice
+        options:
+          - deploy
+          - check_space
+          - free_space
+          - resize_volume
+          - run_command
+          - list_apps
+          - delete_app
+      instance_id:
+        description: EC2 instance ID; blank means Name=github_App
+        required: false
+        default: ""
+      region:
+        description: AWS region
+        required: true
+        default: us-east-1
+      port:
+        description: Host port for deploy
+        required: false
+        default: ""
+      command:
+        description: Approved SSM command
+        required: false
+        default: ""
+      add_gb:
+        description: GB to add for resize_volume
+        required: false
+        default: "10"
+      app_name:
+        description: App slug (repo name, lowercase) for delete_app, or __all__ for every agent app
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  aws:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ inputs.region }}
+      AWS_PAGER: ""
+    steps:
+      - name: Checkout
+        if: inputs.operation == 'deploy'
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubAgentDeploymentRole
+          aws-region: ${{ inputs.region }}
+          role-session-name: GitHubAgent-${{ github.run_id }}
+
+      - name: Verify AWS account
+        run: |
+          set -euo pipefail
+          echo "AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)"
+          echo "AWS_REGION=$AWS_REGION"
+
+      - name: Resolve EC2
+        id: target
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.instance_id }}" ]; then
+            ID="${{ inputs.instance_id }}"
+          else
+            ID="$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" "Name=tag:Name,Values=github_App" --query 'Reservations[].Instances[].InstanceId' --output text | awk '{print $1}')"
+          fi
+          test -n "$ID" && test "$ID" != "None" || { echo "No running EC2 found. Give instance_id or tag an instance Name=github_App."; exit 2; }
+          echo "instance_id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy project to EC2
+        if: inputs.operation == 'deploy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_GH_CLIENT_ID: ${{ secrets.APP_GH_CLIENT_ID }}
+          APP_GH_CLIENT_SECRET: ${{ secrets.APP_GH_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          REPO="${GITHUB_REPOSITORY}"
+          BRANCH="${GITHUB_REF_NAME}"
+          PORT="${{ inputs.port }}"
+          SLUG="$(echo "${REPO##*/}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')"
+          [ -n "$SLUG" ] || SLUG="app"
+          CLONE_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          CLONE_URL_B64="$(printf '%s' "$CLONE_URL" | base64 -w0)"
+          OAUTH_CID_B64="$(printf '%s' "${APP_GH_CLIENT_ID:-}" | base64 -w0)"
+          OAUTH_SECRET_B64="$(printf '%s' "${APP_GH_CLIENT_SECRET:-}" | base64 -w0)"
+
+          cat > /tmp/agent-deploy.sh <<'SCRIPT'
+          set -euo pipefail
+          APP_ROOT=/opt/github-agent/apps
+          REPO_URL="$(printf '%s' "__CLONE_URL_B64__" | base64 -d)"
+          BRANCH="__BRANCH__"
+          SLUG="__SLUG__"
+          APP_DIR="$APP_ROOT/$SLUG"
+          mkdir -p "$APP_ROOT"
+          if ! command -v git >/dev/null 2>&1; then
+            sudo dnf install -y git >/dev/null 2>&1 || sudo yum install -y git >/dev/null 2>&1 || (sudo apt-get update -y >/dev/null 2>&1 && sudo apt-get install -y git >/dev/null 2>&1)
+          fi
+          if ! command -v docker >/dev/null 2>&1; then
+            curl -fsSL https://get.docker.com | sudo sh >/dev/null 2>&1 || true
+          fi
+          sudo systemctl enable --now docker >/dev/null 2>&1 || sudo service docker start >/dev/null 2>&1 || true
+          command -v git >/dev/null 2>&1 || { echo "git could not be installed"; exit 4; }
+          command -v docker >/dev/null 2>&1 || { echo "docker could not be installed"; exit 4; }
+          if [ -d "$APP_DIR/.git" ]; then
+            git -C "$APP_DIR" fetch --depth 1 origin "$BRANCH"
+            git -C "$APP_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
+            git -C "$APP_DIR" reset --hard "origin/$BRANCH"
+          else
+            rm -rf "$APP_DIR"
+            git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+          fi
+          cd "$APP_DIR"
+          DF=Dockerfile
+          if [ ! -f Dockerfile ]; then
+            DF=Dockerfile.agent
+            echo "No Dockerfile in repo - auto-detecting project type..."
+            echo "Files in repo root:"; ls -A | head -50
+            KIND=""; ENTRY=""
+            for F in streamlit_app.py app.py main.py Home.py home.py index.py run.py; do
+              if [ -f "$F" ] && grep -qE "^[[:space:]]*(import|from)[[:space:]]+streamlit" "$F"; then ENTRY="$F"; KIND=streamlit; break; fi
+            done
+            if [ -z "$KIND" ]; then
+              ENTRY="$(grep -rlE "^[[:space:]]*(import|from)[[:space:]]+streamlit" --include='*.py' . 2>/dev/null | grep -vE '/(venv|\.venv|node_modules|site-packages|tests?)/' | head -1 | sed 's|^\./||' || true)"
+              if [ -n "$ENTRY" ]; then KIND=streamlit; fi
+            fi
+            if [ -z "$KIND" ] && [ -f package.json ]; then KIND=node; fi
+            if [ -z "$KIND" ]; then
+              for F in main.py app.py server.py api.py wsgi.py; do
+                [ -f "$F" ] || continue
+                if grep -qE "FastAPI\(" "$F"; then KIND=fastapi; ENTRY="$F"; break; fi
+                if grep -qE "Flask\(" "$F"; then KIND=flask; ENTRY="$F"; break; fi
+              done
+            fi
+            if [ -z "$KIND" ] && [ -f index.html ]; then KIND=static; fi
+            if [ -z "$KIND" ]; then
+              echo "ERROR: could not detect project type (no Dockerfile, and no Streamlit / Flask / FastAPI / Node / static index.html found)."
+              echo "Fix: add a Dockerfile to the repo, or add a Streamlit entry file + requirements.txt."
+              exit 2
+            fi
+            if [ "$KIND" = node ] && ! grep -q '"start"' package.json; then
+              echo "ERROR: package.json has no start script."
+              exit 2
+            fi
+            MOD=""; VAR=app
+            if [ "$KIND" = fastapi ] || [ "$KIND" = flask ]; then
+              MOD="$(printf '%s' "${ENTRY%.py}" | tr '/' '.')"
+              V="$(grep -oE "^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*(FastAPI|Flask)\(" "$ENTRY" 2>/dev/null | head -1 | sed -E 's/[[:space:]]*=.*//' || true)"
+              if [ -n "$V" ]; then VAR="$V"; fi
+            fi
+            echo "Detected project type: $KIND (entry: ${ENTRY:-n/a})"
+            {
+              case "$KIND" in
+                streamlit|fastapi|flask)
+                  echo "FROM python:3.12-slim"
+                  echo "WORKDIR /app"
+                  echo "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1"
+                  if [ -f requirements.txt ]; then
+                    echo "COPY requirements.txt ."
+                    echo "RUN pip install --no-cache-dir -r requirements.txt"
+                  fi
+                  case "$KIND" in
+                    streamlit) echo "RUN pip install --no-cache-dir streamlit" ;;
+                    fastapi) echo "RUN pip install --no-cache-dir fastapi 'uvicorn[standard]'" ;;
+                    flask) echo "RUN pip install --no-cache-dir flask gunicorn" ;;
+                  esac
+                  echo "COPY . ."
+                  echo "EXPOSE 8501"
+                  case "$KIND" in
+                    streamlit) echo "CMD [\"streamlit\",\"run\",\"$ENTRY\",\"--server.address=0.0.0.0\",\"--server.port=8501\",\"--server.headless=true\"]" ;;
+                    fastapi) echo "CMD [\"uvicorn\",\"$MOD:$VAR\",\"--host\",\"0.0.0.0\",\"--port\",\"8501\"]" ;;
+                    flask) echo "CMD [\"gunicorn\",\"-b\",\"0.0.0.0:8501\",\"$MOD:$VAR\"]" ;;
+                  esac
+                  ;;
+                node)
+                  echo "FROM node:20-slim"
+                  echo "WORKDIR /app"
+                  echo "COPY package*.json ./"
+                  echo "RUN npm install --no-audit --no-fund"
+                  echo "COPY . ."
+                  if grep -q '"build"' package.json; then echo "RUN npm run build"; fi
+                  echo "ENV PORT=8501 HOST=0.0.0.0"
+                  echo "EXPOSE 8501"
+                  echo "CMD [\"npm\",\"start\"]"
+                  ;;
+                static)
+                  echo "FROM nginx:alpine"
+                  echo "COPY . /usr/share/nginx/html"
+                  echo "RUN sed -i 's/listen  *80;/listen 8501;/' /etc/nginx/conf.d/default.conf"
+                  echo "EXPOSE 8501"
+                  ;;
+              esac
+            } > "$DF"
+            echo "Generated $DF:"; cat "$DF"
+          fi
+          docker container prune -f >/dev/null 2>&1 || true
+          docker image prune -af >/dev/null 2>&1 || true
+          ROOT_USE="$(df -P / | tail -1 | awk '{gsub("%","",$5); print $5}')"
+          if [ "${ROOT_USE:-0}" -ge 85 ] 2>/dev/null; then docker system prune -af --volumes >/dev/null 2>&1 || true; fi
+          IMAGE="agent/$SLUG:latest"
+          CONTAINER="agent-$SLUG"
+          docker build -f "$DF" -t "$IMAGE" .
+          CPORT="$(docker image inspect "$IMAGE" --format '{{json .Config.ExposedPorts}}' 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
+          if [ -z "$CPORT" ]; then CPORT=8501; fi
+          echo "CONTAINER_PORT=$CPORT"
+          if [ -z "__PORT__" ]; then
+            PORT=""
+            for CANDIDATE in $(seq 8501 8599); do
+              if ! docker ps --format '{{.Ports}}' | grep -Eq "(^|[:,])${CANDIDATE}->|:${CANDIDATE}-"; then PORT="$CANDIDATE"; break; fi
+            done
+          else
+            PORT="__PORT__"
+          fi
+          test -n "$PORT" || { echo "No free host port found"; exit 3; }
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          OAUTH_CID="$(printf '%s' "__OAUTH_CID_B64__" | base64 -d)"
+          OAUTH_SECRET="$(printf '%s' "__OAUTH_SECRET_B64__" | base64 -d)"
+          PUBLIC_IP="$(curl -s -m 2 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)"
+          PUBLIC_APP_URL="http://${PUBLIC_IP}:${PORT}"
+          RUN_ARGS=(-d --restart unless-stopped --name "$CONTAINER" -p "$PORT:$CPORT")
+          HOST_ENV=/opt/github-agent/.env
+          if [ -f "$HOST_ENV" ]; then
+            tr -d '\r' < "$HOST_ENV" > /tmp/agent-run.env
+            RUN_ARGS+=(--env-file /tmp/agent-run.env)
+            echo "OAUTH_ENV=loaded from $HOST_ENV"
+            if ! grep -q '^PUBLIC_APP_URL=' /tmp/agent-run.env; then RUN_ARGS+=(-e "PUBLIC_APP_URL=$PUBLIC_APP_URL"); fi
+          fi
+          if [ -n "$OAUTH_CID" ] && [ -n "$OAUTH_SECRET" ]; then
+            RUN_ARGS+=(-e "GITHUB_CLIENT_ID=$OAUTH_CID" -e "GITHUB_CLIENT_SECRET=$OAUTH_SECRET" -e "PUBLIC_APP_URL=$PUBLIC_APP_URL")
+            echo "OAUTH_ENV=configured"
+          else
+            echo "OAUTH_ENV=missing (set APP_GH_CLIENT_ID / APP_GH_CLIENT_SECRET repo secrets to enable GitHub OAuth on this deploy)"
+          fi
+          docker run "${RUN_ARGS[@]}" "$IMAGE"
+          sleep 8
+          if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)" != "true" ]; then
+            echo "ERROR: container exited right after start. Last logs:"
+            docker logs --tail 60 "$CONTAINER" 2>&1 || true
+            exit 5
+          fi
+          echo "PORT=$PORT"
+          echo "CONTAINER=$CONTAINER"
+          echo "IMAGE=$IMAGE"
+          SCRIPT
+          sed -i "s#__CLONE_URL_B64__#${CLONE_URL_B64}#g; s#__BRANCH__#${BRANCH}#g; s#__SLUG__#${SLUG}#g; s#__PORT__#${PORT}#g; s#__OAUTH_CID_B64__#${OAUTH_CID_B64}#g; s#__OAUTH_SECRET_B64__#${OAUTH_SECRET_B64}#g" /tmp/agent-deploy.sh
+          COMMAND_B64="$(base64 -w0 /tmp/agent-deploy.sh)"
+          PARAMS_JSON="$(jq -nc --arg c "echo $COMMAND_B64 | base64 -d | bash" "{commands:[\$c]}")"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters "$PARAMS_JSON" --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 180); do
+            STATUS="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$STATUS" = "Success" ]; then
+              OUT="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text)"
+              echo "$OUT"
+              PUBLIC="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+              HOST="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicDnsName' --output text)"
+              H="$PUBLIC"; [ "$H" = "None" ] || [ -z "$H" ] && H="$HOST"
+              ACTUAL_PORT="$(printf '%s\n' "$OUT" | awk -F= '/^PORT=/{print $2}' | tail -1)"
+              SG="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)"
+              aws ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port "$ACTUAL_PORT" --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+              echo "INSTANCE_ID=$ID"
+              echo "PUBLIC_HOST=$H"
+              echo "ACTUAL_PORT=$ACTUAL_PORT"
+              echo "AGENT_LIVE_URL=http://${H}:${ACTUAL_PORT}"
+              exit 0
+            fi
+            if [[ "$STATUS" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then
+              echo "===== EC2 script output (stdout, last 80 lines) ====="
+              aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text | tail -80 || true
+              echo "===== EC2 script errors (stderr, last 40 lines) ====="
+              aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text | tail -40 || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for SSM command"
+          exit 1
+
+      - name: Check EC2 space
+        if: inputs.operation == 'check_space'
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters 'commands=["df -h /; echo; docker system df 2>/dev/null || true; echo; free -h; echo; uptime"]' --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 60); do
+            S="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$S" = "Success" ]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text; exit 0; fi
+            if [[ "$S" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text; exit 1; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Free EC2 space
+        if: inputs.operation == 'free_space'
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters 'commands=["docker container prune -f; docker image prune -af; docker builder prune -af; docker volume prune -f; sudo journalctl --vacuum-size=50M || true; df -h /"]' --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 90); do
+            S="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$S" = "Success" ]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text; exit 0; fi
+            if [[ "$S" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text; exit 1; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Resize root EBS volume
+        if: inputs.operation == 'resize_volume'
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          VOL="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId' --output text)"
+          CUR="$(aws ec2 describe-volumes --volume-ids "$VOL" --query 'Volumes[0].Size' --output text)"
+          TARGET=$((CUR + ${{ inputs.add_gb }}))
+          aws ec2 modify-volume --volume-id "$VOL" --size "$TARGET"
+          echo "Requested EBS resize: ${CUR}GB -> ${TARGET}GB"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters 'commands=["lsblk; command -v growpart >/dev/null 2>&1 && sudo growpart /dev/xvda 1 || true; sudo resize2fs /dev/xvda1 2>/dev/null || sudo xfs_growfs -d / 2>/dev/null || true; df -h /"]' --query 'Command.CommandId' --output text)"
+          sleep 5
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text || true
+
+      - name: Run approved command
+        if: inputs.operation == 'run_command'
+        run: |
+          set -euo pipefail
+          test -n "${{ inputs.command }}" || { echo "No command supplied"; exit 2; }
+          ID="${{ steps.target.outputs.instance_id }}"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters "commands=[${{ toJSON(inputs.command) }}]" --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 120); do
+            S="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$S" = "Success" ]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text; exit 0; fi
+            if [[ "$S" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text; exit 1; fi
+            sleep 2
+          done
+          exit 1
+
+      - name: List deployed apps
+        if: inputs.operation == 'list_apps'
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          cat > /tmp/agent-list.sh <<'SCRIPT'
+          APP_ROOT=/opt/github-agent/apps
+          echo "=== App folders in $APP_ROOT ==="
+          ls -1 "$APP_ROOT" 2>/dev/null || echo "(none)"
+          echo
+          echo "=== Agent containers (name | status | ports) ==="
+          docker ps -a --filter "name=^agent-" --format "{{.Names}} | {{.Status}} | {{.Ports}}" 2>/dev/null || true
+          echo
+          echo "=== Disk / memory ==="
+          df -h / | tail -1
+          free -h | sed -n 2p
+          SCRIPT
+          COMMAND_B64="$(base64 -w0 /tmp/agent-list.sh)"
+          PARAMS_JSON="$(jq -nc --arg c "echo $COMMAND_B64 | base64 -d | bash" "{commands:[\$c]}")"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters "$PARAMS_JSON" --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 60); do
+            S="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$S" = "Success" ]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text; exit 0; fi
+            if [[ "$S" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text; exit 1; fi
+            sleep 2
+          done
+          echo "Timed out waiting for SSM command"
+          exit 1
+
+      - name: Delete deployed app
+        if: inputs.operation == 'delete_app'
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          ID="${{ steps.target.outputs.instance_id }}"
+          if [ "$APP_NAME" = "__all__" ]; then
+            TARGET="__all__"
+          else
+            TARGET="$(printf '%s' "${APP_NAME##*/}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g' | sed 's/^[.-]*//;s/[.-]*$//')"
+          fi
+          test -n "$TARGET" || { echo "No app_name given - nothing deleted."; exit 2; }
+          cat > /tmp/agent-delete.sh <<'SCRIPT'
+          set -uo pipefail
+          APP_ROOT=/opt/github-agent/apps
+          TARGET="__TARGET__"
+          delete_one() {
+            S="$1"
+            case "$S" in ""|.|..|*/*) echo "SKIPPED invalid name: $S"; return 0 ;; esac
+            C="agent-$S"; I="agent/$S:latest"
+            P="$(docker port "$C" 2>/dev/null | head -1 | sed 's/.*://' || true)"
+            FOUND=0
+            if docker inspect "$C" >/dev/null 2>&1; then
+              docker rm -f "$C" >/dev/null 2>&1 && echo "removed container $C"
+              FOUND=1
+            fi
+            if docker image inspect "$I" >/dev/null 2>&1; then
+              docker rmi -f "$I" >/dev/null 2>&1 && echo "removed image $I"
+              FOUND=1
+            fi
+            if [ -d "$APP_ROOT/$S" ]; then
+              rm -rf "${APP_ROOT:?}/$S" && echo "removed folder $APP_ROOT/$S"
+              FOUND=1
+            fi
+            if [ "$FOUND" = "1" ]; then
+              echo "DELETED_APP=$S"
+              if [ -n "$P" ]; then echo "FREED_PORT=$P"; fi
+            else
+              echo "NOT_FOUND=$S"
+            fi
+          }
+          if [ "$TARGET" = "__all__" ]; then
+            for D in "$APP_ROOT"/*/; do
+              if [ -d "$D" ]; then delete_one "$(basename "$D")"; fi
+            done
+            for CN in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep '^agent-' || true); do
+              delete_one "${CN#agent-}"
+            done
+          else
+            delete_one "$TARGET"
+          fi
+          docker image prune -f >/dev/null 2>&1 || true
+          echo "--- remaining apps ---"
+          ls -1 "$APP_ROOT" 2>/dev/null || echo "(none)"
+          docker ps -a --filter "name=^agent-" --format "{{.Names}}  {{.Status}}" 2>/dev/null || true
+          SCRIPT
+          sed -i "s#__TARGET__#${TARGET}#g" /tmp/agent-delete.sh
+          COMMAND_B64="$(base64 -w0 /tmp/agent-delete.sh)"
+          PARAMS_JSON="$(jq -nc --arg c "echo $COMMAND_B64 | base64 -d | bash" "{commands:[\$c]}")"
+          CID="$(aws ssm send-command --instance-ids "$ID" --document-name AWS-RunShellScript --parameters "$PARAMS_JSON" --query 'Command.CommandId' --output text)"
+          for i in $(seq 1 90); do
+            S="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query Status --output text 2>/dev/null || true)"
+            if [ "$S" = "Success" ]; then
+              OUT="$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text)"
+              echo "$OUT"
+              SG="$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)"
+              for P in $(printf '%s\n' "$OUT" | awk -F= '/^FREED_PORT=/{print $2}'); do
+                if [[ "$P" =~ ^[0-9]+$ ]]; then
+                  if aws ec2 revoke-security-group-ingress --group-id "$SG" --protocol tcp --port "$P" --cidr 0.0.0.0/0 >/dev/null 2>&1; then
+                    echo "SG_RULE_CLOSED=$P"
+                  else
+                    echo "SG_RULE_STILL_OPEN=$P (role has no ec2:RevokeSecurityGroupIngress, or rule was already gone - remove it in the EC2 console if needed)"
+                  fi
+                fi
+              done
+              exit 0
+            fi
+            if [[ "$S" =~ ^(Failed|TimedOut|Cancelled|Cancelling)$ ]]; then
+              echo "===== EC2 script output (stdout, last 60 lines) ====="
+              aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardOutputContent --output text | tail -60 || true
+              echo "===== EC2 script errors (stderr, last 40 lines) ====="
+              aws ssm get-command-invocation --command-id "$CID" --instance-id "$ID" --query StandardErrorContent --output text | tail -40 || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Timed out waiting for SSM command"
+          exit 1
